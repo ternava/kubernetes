@@ -1,0 +1,179 @@
+# GitHub Action: Feature Gate Expiration Checker
+#
+# This workflow checks for feature gates that are due for removal in upcoming
+# Kubernetes releases. Add this to your Kubernetes fork at:
+#   .github/workflows/check-feature-gate-expiration.yml
+#
+# It runs:
+#   - On every push to main/master
+#   - On PRs that modify feature gate files
+#   - On a schedule (weekly) to catch upcoming expirations
+#   - Manually via workflow_dispatch
+
+name: Feature Gate Expiration Check
+
+on:
+  push:
+    branches: [main, master, release-*]
+    paths:
+      - '**/kube_features.go'
+  pull_request:
+    paths:
+      - '**/kube_features.go'
+  schedule:
+    # Run weekly on Monday at 9:00 UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      upcoming_version:
+        description: 'Upcoming Kubernetes version to check (e.g., 1.35)'
+        required: true
+        default: '1.35'
+
+jobs:
+  check-expiring-features:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Determine upcoming version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.upcoming_version }}" >> $GITHUB_OUTPUT
+          else
+            # Try to detect from branch name or default to 1.35
+            BRANCH="${GITHUB_REF_NAME:-main}"
+            if [[ "$BRANCH" =~ release-([0-9]+\.[0-9]+) ]]; then
+              CURRENT="${BASH_REMATCH[1]}"
+              MAJOR=$(echo $CURRENT | cut -d. -f1)
+              MINOR=$(echo $CURRENT | cut -d. -f2)
+              echo "version=${MAJOR}.$((MINOR + 1))" >> $GITHUB_OUTPUT
+            else
+              echo "version=1.35" >> $GITHUB_OUTPUT
+            fi
+          fi
+          
+      - name: Check for expiring feature gates
+        id: check
+        run: |
+          UPCOMING="${{ steps.version.outputs.version }}"
+          echo "Checking for features due in Kubernetes $UPCOMING..."
+          
+          # Create the checker script inline
+          cat > /tmp/check_features.sh << 'SCRIPT'
+          #!/bin/bash
+          UPCOMING_VERSION="$1"
+          KUBE_DIR="$2"
+          
+          version_to_num() {
+              echo "$1" | awk -F'.' '{print $1 * 100 + $2}'
+          }
+          
+          UPCOMING_NUM=$(version_to_num "$UPCOMING_VERSION")
+          CURRENT_NUM=$((UPCOMING_NUM - 1))
+          
+          echo "## Feature Gate Expiration Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Upcoming Version:** $UPCOMING_VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          OVERDUE=""
+          DUE=""
+          
+          while IFS= read -r file; do
+              [[ "$file" == *"/vendor/"* ]] && continue
+              
+              results=$(awk -v upcoming_num="$UPCOMING_NUM" -v current_num="$CURRENT_NUM" '
+              BEGIN { feature = ""; in_block = 0 }
+              /^[[:space:]]*[A-Za-z][A-Za-z0-9_]*:[[:space:]]*\{/ {
+                  gsub(/^[[:space:]]+/, ""); gsub(/:[[:space:]]*\{.*/, "")
+                  feature = $0; in_block = 1; next
+              }
+              /^[[:space:]]*[a-z]+features\.[A-Za-z][A-Za-z0-9_]*:[[:space:]]*\{/ {
+                  gsub(/^[[:space:]]+/, ""); gsub(/:[[:space:]]*\{.*/, "")
+                  feature = $0; in_block = 1; next
+              }
+              in_block && /[Rr]emove.*[0-9]+\.[0-9]+/ {
+                  if (match($0, /[Rr]emove[^0-9]*[0-9]+\.[0-9]+/)) {
+                      part = substr($0, RSTART, RLENGTH)
+                      if (match(part, /[0-9]+\.[0-9]+/)) {
+                          ver = substr(part, RSTART, RLENGTH)
+                          split(ver, v, ".")
+                          num = v[1] * 100 + v[2]
+                          if (num < current_num) print "OVERDUE:" feature ":" ver
+                          else if (num == upcoming_num) print "DUE:" feature ":" ver
+                      }
+                  }
+              }
+              /^[[:space:]]*\},?[[:space:]]*$/ && in_block { in_block = 0; feature = "" }
+              ' "$file")
+              
+              while IFS=':' read -r status feat ver; do
+                  [ -z "$status" ] && continue
+                  if [ "$status" = "OVERDUE" ]; then
+                      OVERDUE="$OVERDUE\n- **$feat** (should have been removed in $ver)"
+                  elif [ "$status" = "DUE" ]; then
+                      DUE="$DUE\n- **$feat** (remove in $ver)"
+                  fi
+              done <<< "$results"
+          done < <(find "$KUBE_DIR" -name "kube_features.go" -type f 2>/dev/null)
+          
+          EXIT_CODE=0
+          
+          if [ -n "$OVERDUE" ]; then
+              echo "### 🚨 OVERDUE Features" >> $GITHUB_STEP_SUMMARY
+              echo -e "$OVERDUE" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              EXIT_CODE=1
+          fi
+          
+          if [ -n "$DUE" ]; then
+              echo "### ⚠️ Features Due in $UPCOMING_VERSION" >> $GITHUB_STEP_SUMMARY
+              echo -e "$DUE" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              [ "$EXIT_CODE" -eq 0 ] && EXIT_CODE=2
+          fi
+          
+          if [ "$EXIT_CODE" -eq 0 ]; then
+              echo "### ✅ No Features Due" >> $GITHUB_STEP_SUMMARY
+              echo "No feature gates are overdue or due for removal in $UPCOMING_VERSION" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          exit $EXIT_CODE
+          SCRIPT
+          
+          chmod +x /tmp/check_features.sh
+          /tmp/check_features.sh "$UPCOMING" "."
+          
+      - name: Create issue for due features
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Feature gates due for removal in upcoming release`;
+            const body = `The weekly feature gate expiration check has found features that need attention.
+            
+            Please review the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
+            
+            This issue was automatically created by the Feature Gate Expiration Checker workflow.`;
+            
+            // Check if similar issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'feature-gate-expiration'
+            });
+            
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['feature-gate-expiration', 'kind/cleanup']
+              });
+            }
